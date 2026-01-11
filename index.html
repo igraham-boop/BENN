@@ -1,0 +1,995 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ben Stone V. Focus Max</title>
+  <style>
+    html,body{height:100%;margin:0;background:#07080b;color:#eaf2ff;font-family:system-ui,Segoe UI,Arial}
+    canvas{display:block;margin:0 auto;background:#07080b;image-rendering:pixelated;image-rendering:crisp-edges}
+  </style>
+</head>
+<body>
+<canvas id="c" width="960" height="540"></canvas>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+
+  // -----------------------------
+  // Controls
+  // -----------------------------
+  const keys = new Map();
+  addEventListener("keydown", (e)=>{
+    if(["ArrowLeft","ArrowRight","ArrowUp","Space"].includes(e.code)) e.preventDefault();
+    keys.set(e.code,true);
+    if(e.code==="Space"){
+      if(state===S.TITLE) state=S.INSTR;
+      else if(state===S.INSTR) startGame();
+      else if(state===S.LEVELCLEAR) nextLevel();
+      else if(state===S.WIN || state===S.OVER) state=S.TITLE;
+    }
+  }, {passive:false});
+  addEventListener("keyup",(e)=>keys.set(e.code,false));
+  const down = (k)=>!!keys.get(k);
+
+  // -----------------------------
+  // Audio bleeps (optional)
+  // -----------------------------
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  let ac = null;
+  function beep(freq=440, dur=0.06, type="square", vol=0.03){
+    try{
+      if(!ac) ac = new AudioCtx();
+      const o = ac.createOscillator();
+      const g = ac.createGain();
+      o.type = type; o.frequency.value = freq;
+      g.gain.value = vol;
+      o.connect(g); g.connect(ac.destination);
+      o.start(); o.stop(ac.currentTime + dur);
+    }catch(_){}
+  }
+
+  // -----------------------------
+  // Game state
+  // -----------------------------
+  const S = { TITLE:0, INSTR:1, PLAY:2, LEVELCLEAR:3, WIN:4, OVER:5, DEATHMORPH:6 };
+  let state = S.TITLE;
+
+  // Physics
+  const GRAV = 2350;
+  const DT_CAP = 1/30;
+
+  // Score / level
+  let levelIndex = 0;
+  let score = 0;
+  let high = 0;
+
+  // Entities
+  let platforms = [];
+  let ladders = [];
+  let bottles = [];
+  let hotdogs = [];
+  let topGoal = null;
+  let villain = null;
+
+  // Ben
+  const ben = {
+    x: 120, y: 460, w: 28, h: 44,
+    vx: 0, vy: 0,
+    facing: 1,
+    onGround: false,
+    onLadder: false,
+    ladderId: -1,
+    invuln: 0,
+    lives: 2,
+    anim: 0,
+    form: "ben",
+    prevY: 0
+  };
+
+  let deathMorph = { t:0, x:0, y:0 };
+
+  // Utility
+  const clamp = (v,min,max)=>Math.max(min,Math.min(max,v));
+  const rOverlap = (a,b)=>(
+    a.x < b.x+b.w && a.x+a.w > b.x &&
+    a.y < b.y+b.h && a.y+a.h > b.y
+  );
+
+  // -----------------------------
+  // Level definitions
+  // -----------------------------
+  const LEVELS = [
+    { name: "COURTROOM CLIMB", bottleBaseRate: 1.25, ladderDropChance: 0.12, bottleSpeed: 170, hotdogCount: 2, goalType: "gavel" },
+    { name: "APPEALS RAMPAGE", bottleBaseRate: 0.95, ladderDropChance: 0.20, bottleSpeed: 205, hotdogCount: 3, goalType: "gavel" },
+    { name: "OBJECTION ONSLAUGHT", bottleBaseRate: 0.75, ladderDropChance: 0.30, bottleSpeed: 235, hotdogCount: 4, goalType: "gavel" },
+    { name: "THE JURY GAUNTLET (BOSS)", bottleBaseRate: 0.52, ladderDropChance: 0.45, bottleSpeed: 275, hotdogCount: 6, goalType: "jury" }
+  ];
+
+  // TOP surface of ramp at x
+  function platformYAtX(p, x){
+    const t = (x - p.x0) / (p.x1 - p.x0);
+    return p.y0 + (p.y1 - p.y0)*t;
+  }
+
+  // Determine rolling direction "downhill" on a platform
+  function downhillDir(p){
+    // lower end has bigger y (down the screen)
+    // if left end is lower (y0 > y1), downhill is to the left (-1), else right (+1)
+    return (p.y0 > p.y1) ? -1 : 1;
+  }
+
+  function addScore(pts){ score += pts; if(score>high) high=score; }
+
+  // -----------------------------
+  // Natural landing: only land if feet CROSS the platform while FALLING
+  // -----------------------------
+  function resolveGroundCrossing(entity){
+    if(entity.vy < 0) { entity.onGround = false; return -1; } // rising: cannot land
+
+    const cx = entity.x + entity.w/2;
+    const prevBottom = entity.prevY + entity.h;
+    const currBottom = entity.y + entity.h;
+
+    let best = null;
+
+    for(let i=0;i<platforms.length;i++){
+      const p = platforms[i];
+      if(cx < p.x0+1 || cx > p.x1-1) continue;
+
+      const py = platformYAtX(p, cx);
+
+      // crossing test (with small epsilon)
+      const eps = 3;
+      const crossed = (prevBottom <= py + eps) && (currBottom >= py - eps);
+
+      if(crossed){
+        const penetration = currBottom - py;
+        if(!best || penetration < best.pen){
+          best = { i, py, pen: penetration };
+        }
+      }
+    }
+
+    if(best){
+      entity.y = best.py - entity.h;
+      entity.vy = 0;
+      entity.onGround = true;
+      return best.i;
+    }
+
+    entity.onGround = false;
+    return -1;
+  }
+
+  function checkLadder(entity){
+    const cx = entity.x + entity.w/2;
+    const cy = entity.y + entity.h/2;
+    for(let i=0;i<ladders.length;i++){
+      const L = ladders[i];
+      if(cx > L.x && cx < L.x+L.w && cy > L.y && cy < L.y+L.h) return i;
+    }
+    return -1;
+  }
+
+  function isInJumpZone(entity, p){
+    const cx = entity.x + entity.w/2;
+    const z = p.jumpZone;
+    return (cx > z.x && cx < z.x + z.w);
+  }
+
+  // -----------------------------
+  // Build Level
+  // -----------------------------
+  function buildLevel(idx){
+    const L = LEVELS[idx];
+    platforms = [];
+    ladders = [];
+    bottles = [];
+    hotdogs = [];
+    topGoal = null;
+    villain = null;
+
+    const leftMargin = 90;
+    const rightMargin = W-90;
+    const rampCount = (idx===3 ? 7 : 6);
+    const verticalGap = (idx===0 ? 74 : 78);
+    const rampLen = 520;
+    const rampThickness = 16;
+
+    for(let i=0;i<rampCount;i++){
+      const y = H - 70 - i*verticalGap;
+      const dir = (i%2===0) ? 1 : -1;
+
+      const xMid = (i%2===0) ? (leftMargin + 280) : (rightMargin - 280);
+      const x0 = clamp(xMid - rampLen/2, leftMargin, rightMargin - rampLen);
+      const x1 = x0 + rampLen;
+
+      const yLeft = y + (dir===1 ? 24 : 0);
+      const yRight = y + (dir===1 ? 0 : 24);
+
+      platforms.push({
+        x0, x1,
+        y0: yLeft, y1: yRight,
+        thick: rampThickness,
+        dir,
+        jumpZone: (() => {
+          const highX = (dir===1) ? x0 : x1;
+          return { x: highX + (dir===1 ? 18 : -48), w: 46 };
+        })()
+      });
+    }
+
+    // Ladders
+    for(let i=0;i<platforms.length-1;i++){
+      const pA = platforms[i];
+      const pB = platforms[i+1];
+
+      const lx = (pA.dir===1) ? (pA.x0 + 240) : (pA.x0 + 280);
+
+      const topY = platformYAtX(pB, lx);
+      const botY = platformYAtX(pA, lx);
+
+      ladders.push({ x: lx-8, y: Math.min(topY, botY), w: 16, h: Math.abs(botY-topY), a:i, b:i+1 });
+
+      if(idx>=2 && i%2===0){
+        const lx2 = (pA.dir===1) ? (pA.x0 + 360) : (pA.x0 + 170);
+        const topY2 = platformYAtX(pB, lx2);
+        const botY2 = platformYAtX(pA, lx2);
+        ladders.push({ x: lx2-8, y: Math.min(topY2, botY2), w: 16, h: Math.abs(botY2-topY2), a:i, b:i+1 });
+      }
+    }
+
+    // Villain
+    const topP = platforms[platforms.length-1];
+    const vx = (topP.dir===1) ? (topP.x1-90) : (topP.x0+90);
+    const vy = platformYAtX(topP, vx) - 58;
+    villain = { x:vx, y:vy, w:28, h:44, anim:0 };
+
+    // Goal
+    if(L.goalType==="gavel"){
+      const gx = (topP.dir===1) ? (topP.x0+90) : (topP.x1-90);
+      const gy = platformYAtX(topP, gx) - 60;
+      topGoal = { type:"gavel", x:gx, y:gy, w:30, h:22 };
+    } else {
+      const baseX = (topP.dir===1) ? (topP.x0+120) : (topP.x1-240);
+      const baseY = platformYAtX(topP, baseX) - 60;
+      topGoal = { type:"jury", members: Array.from({length:5}).map((_,k)=>({ x: baseX + k*28, y: baseY + (k%2?6:0), w: 20, h: 26 })) };
+    }
+
+    // Hotdogs
+    for(let i=0;i<L.hotdogCount;i++){
+      const p = platforms[1 + (i % Math.max(1, platforms.length-2))];
+      const x = p.x0 + 180 + (i*90)%260;
+      const y = platformYAtX(p, x + 15) - 22;
+      hotdogs.push({
+        x, y, w: 30, h: 22,
+        vx: (i%2? 68 : -78) * (1 + idx*0.12),
+        platformId: platforms.indexOf(p),
+        anim: Math.random()*1000
+      });
+    }
+  }
+
+  // -----------------------------
+  // Spawn / Reset
+  // -----------------------------
+  function resetBenForLevel(){
+    ben.vx = 0; ben.vy = 0;
+    ben.onLadder = false; ben.ladderId = -1;
+    ben.invuln = 1.2;
+    ben.anim = 0;
+
+    const p0 = platforms[0];
+    ben.x = clamp(p0.x0 + 90, 20, W-20-ben.w);
+    const surfaceY = platformYAtX(p0, ben.x + ben.w/2);
+    ben.y = surfaceY - ben.h;
+    ben.onGround = true;
+    ben.prevY = ben.y;
+  }
+
+  function startGame(){
+    levelIndex = 0;
+    score = 0;
+    ben.lives = 2;
+    ben.form = "ben";
+    buildLevel(levelIndex);
+    resetBenForLevel();
+    bottleTimer = 0;
+    bossPulse = 0;
+    state = S.PLAY;
+    beep(660,0.08,"square",0.04);
+  }
+
+  function nextLevel(){
+    levelIndex++;
+    if(levelIndex >= LEVELS.length){
+      state = S.WIN;
+      beep(880,0.14,"triangle",0.04);
+      return;
+    }
+    buildLevel(levelIndex);
+    resetBenForLevel();
+    bottleTimer = 0;
+    bossPulse = 0;
+    state = S.PLAY;
+    beep(720,0.08,"square",0.04);
+  }
+
+  // -----------------------------
+  // Death / Lives
+  // -----------------------------
+  function hitBen(){
+    if(ben.invuln > 0 || ben.form !== "ben") return;
+    ben.lives -= 1;
+    ben.invuln = 1.2;
+    beep(220,0.12,"square",0.05);
+    ben.vy = -520;
+    ben.vx = -ben.facing * 260;
+
+    if(ben.lives < 0){
+      deathMorph.t = 0;
+      deathMorph.x = ben.x;
+      deathMorph.y = ben.y;
+      state = S.DEATHMORPH;
+      beep(140,0.18,"sawtooth",0.05);
+    }
+  }
+
+  function updateDeathMorph(dt){
+    deathMorph.t = Math.min(1, deathMorph.t + dt*1.8);
+    if(deathMorph.t >= 1){
+      ben.form = "hotdog";
+      state = S.OVER;
+    }
+  }
+
+  // -----------------------------
+  // Bottles: roll -> (optional ladder) -> drop to next platform -> roll
+  // -----------------------------
+  let bottleTimer = 0;
+  let bossPulse = 0;
+
+  function spawnBottle(mode="normal"){
+    const L = LEVELS[levelIndex];
+    const topId = platforms.length-1;
+    const pTop = platforms[topId];
+
+    const startX = villain.x + (villain.w/2) + (pTop.dir===1 ? -10 : 10);
+    const startY = platformYAtX(pTop, startX) - 34;
+
+    const speed = L.bottleSpeed * (mode==="fast" ? 1.25 : 1.0);
+    const rollDir = downhillDir(pTop); // roll downhill
+    bottles.push({
+      x: startX, y: startY,
+      w: 22, h: 22,
+      vx: rollDir * speed,
+      vy: 0,
+      state: "roll", // roll | ladder | drop | fall
+      platformId: topId,
+      dropTo: -1,
+      ladderId: -1,
+      rot: 0,
+      prevY: startY
+    });
+  }
+
+  function findLadderNearX(x){
+    for(let i=0;i<ladders.length;i++){
+      const Ld = ladders[i];
+      if(x > Ld.x-10 && x < Ld.x+Ld.w+10) return i;
+    }
+    return -1;
+  }
+
+  // -----------------------------
+  // Update Loop
+  // -----------------------------
+  let last = performance.now();
+  let t = 0;
+
+  function update(dt){
+    t += dt;
+    if(state === S.DEATHMORPH){ updateDeathMorph(dt); return; }
+    if(state !== S.PLAY) return;
+
+    const L = LEVELS[levelIndex];
+    villain.anim += dt*10;
+
+    // Spawn bottles
+    bottleTimer -= dt;
+    if(bottleTimer <= 0){
+      spawnBottle("normal");
+      bottleTimer = L.bottleBaseRate * (0.80 + Math.random()*0.40);
+      if(levelIndex === 3){
+        bossPulse += 1;
+        if(bossPulse % 3 === 0) spawnBottle("fast");
+        if(bossPulse % 5 === 0){ spawnBottle("normal"); spawnBottle("normal"); }
+      }
+    }
+
+    // --- Ben ---
+    const accel = 1550;
+    const maxV = 210;
+    const friction = 0.80;
+
+    ben.anim += dt * (Math.abs(ben.vx)>10 ? 12 : 6);
+
+    // store previous Y for crossing test
+    ben.prevY = ben.y;
+
+    // Ladder logic
+    const lid = checkLadder(ben);
+    if(ben.onLadder){
+      const Ld = ladders[ben.ladderId];
+      const cx = ben.x + ben.w/2;
+      const cy = ben.y + ben.h/2;
+      if(!(cx > Ld.x && cx < Ld.x+Ld.w && cy > Ld.y-6 && cy < Ld.y+Ld.h+6)){
+        ben.onLadder = false; ben.ladderId = -1;
+      }
+    } else {
+      if(lid !== -1 && down("ArrowUp")){
+        ben.onLadder = true;
+        ben.ladderId = lid;
+        ben.vy = 0;
+        ben.x = ladders[lid].x + ladders[lid].w/2 - ben.w/2;
+      }
+    }
+
+    if(ben.onLadder){
+      const climb = 150;
+      ben.vx = 0;
+      if(down("ArrowUp")) ben.y -= climb*dt;
+      ben.vy = 0;
+      if(down("ArrowLeft")||down("ArrowRight")){
+        ben.onLadder = false; ben.ladderId = -1;
+      }
+    } else {
+      if(down("ArrowLeft")){ ben.vx -= accel*dt; ben.facing = -1; }
+      if(down("ArrowRight")){ ben.vx += accel*dt; ben.facing = 1; }
+      ben.vx = clamp(ben.vx, -maxV, maxV);
+
+      if(down("Space") && ben.onGround){
+        // find which platform he's on for jump-zone check
+        const cx = ben.x + ben.w/2;
+        let pid = -1;
+        for(let i=0;i<platforms.length;i++){
+          const p = platforms[i];
+          if(cx>=p.x0 && cx<=p.x1){
+            const py = platformYAtX(p,cx);
+            if(Math.abs((ben.y+ben.h)-py) < 3) { pid=i; break; }
+          }
+        }
+        const p = (pid>=0) ? platforms[pid] : null;
+        const inJumpZone = p ? isInJumpZone(ben,p) : false;
+
+        // Harder baseline; boosted feels better but still “real”
+        const baseJump = -560;
+        const boostedJump = -720;
+
+        ben.vy = inJumpZone ? boostedJump : baseJump;
+        ben.vx += ben.facing * (inJumpZone ? 55 : 25);
+        ben.onGround = false;
+
+        beep(inJumpZone ? 740 : 560, 0.06, "square", 0.04);
+        addScore(inJumpZone ? 15 : 5);
+      }
+
+      ben.vy += GRAV*dt;
+    }
+
+    // integrate
+    ben.x += ben.vx*dt;
+    ben.y += ben.vy*dt;
+    ben.x = clamp(ben.x, 20, W-20-ben.w);
+
+    // land naturally (crossing)
+    resolveGroundCrossing(ben);
+
+    // slope slide + friction
+    if(ben.onGround){
+      // apply mild slope slide to make it harder
+      const cx = ben.x + ben.w/2;
+      for(let i=0;i<platforms.length;i++){
+        const p = platforms[i];
+        if(cx>=p.x0 && cx<=p.x1){
+          const py = platformYAtX(p,cx);
+          if(Math.abs((ben.y+ben.h)-py) < 2){
+            ben.vx += (p.dir===1 ? 28 : -28)*dt;
+            ben.vx *= friction;
+            break;
+          }
+        }
+      }
+    } else {
+      ben.vx *= 0.995;
+    }
+
+    if(ben.y > H+80){
+      hitBen();
+      resetBenForLevel();
+    }
+
+    ben.invuln = Math.max(0, ben.invuln - dt);
+
+    // --- Hotdogs ---
+    for(const h of hotdogs){
+      h.anim += dt*10;
+      h.x += h.vx*dt;
+
+      const p = platforms[h.platformId];
+      if(h.x < p.x0+20){ h.x = p.x0+20; h.vx *= -1; }
+      if(h.x > p.x1-50){ h.x = p.x1-50; h.vx *= -1; }
+
+      h.y = platformYAtX(p, h.x + h.w/2) - h.h;
+
+      if(rOverlap({x:h.x,y:h.y,w:h.w,h:h.h},{x:ben.x,y:ben.y,w:ben.w,h:ben.h})) hitBen();
+    }
+
+    // --- Bottles ---
+    for(let i=bottles.length-1;i>=0;i--){
+      const b = bottles[i];
+      b.rot += dt*10;
+      b.prevY = b.y;
+
+      if(b.state === "roll"){
+        const p = platforms[b.platformId];
+        // stick to surface while rolling
+        const cx = b.x + b.w/2;
+        b.y = platformYAtX(p, cx) - b.h;
+
+        // move along ramp
+        b.x += b.vx*dt;
+
+        // sometimes drop down ladder when near one
+        if(Math.random() < L.ladderDropChance * dt * 2.2){
+          const near = findLadderNearX(b.x + b.w/2);
+          if(near !== -1){
+            const Ld = ladders[near];
+            b.state = "ladder";
+            b.ladderId = near;
+            b.vx = 0;
+            b.vy = 10;
+            b.x = Ld.x + Ld.w/2 - b.w/2;
+            b.y = Ld.y - b.h/2;
+            beep(320,0.04,"square",0.03);
+          }
+        }
+
+        // reached end? -> DROP to next platform below
+        const endPad = 6;
+        if(b.vx < 0 && b.x <= p.x0 + endPad){
+          b.state = "drop";
+          b.dropTo = b.platformId - 1;
+          // clamp x into the next platform so it can't miss
+          if(b.dropTo >= 0){
+            const nextP = platforms[b.dropTo];
+            b.x = clamp(b.x, nextP.x0+8, nextP.x1-8);
+          }
+          b.vy = 0;
+        } else if(b.vx > 0 && b.x + b.w >= p.x1 - endPad){
+          b.state = "drop";
+          b.dropTo = b.platformId - 1;
+          if(b.dropTo >= 0){
+            const nextP = platforms[b.dropTo];
+            b.x = clamp(b.x, nextP.x0+8, nextP.x1-8);
+          }
+          b.vy = 0;
+        }
+
+      } else if(b.state === "drop"){
+        // straight drop down to the next platform
+        b.vy += GRAV*dt*0.85;
+        b.y += b.vy*dt;
+
+        if(b.dropTo >= 0){
+          const p2 = platforms[b.dropTo];
+          const cx = b.x + b.w/2;
+          const py = platformYAtX(p2, cx);
+          const prevBottom = b.prevY + b.h;
+          const currBottom = b.y + b.h;
+
+          if(prevBottom <= py + 3 && currBottom >= py - 3){
+            // land and resume rolling downhill
+            b.y = py - b.h;
+            b.platformId = b.dropTo;
+            b.dropTo = -1;
+            b.state = "roll";
+            b.vy = 0;
+            const dir = downhillDir(platforms[b.platformId]);
+            b.vx = dir * (L.bottleSpeed * (0.95 + Math.random()*0.20));
+          }
+        } else {
+          // no platform below -> just fall off
+          b.state = "fall";
+        }
+
+      } else if(b.state === "ladder"){
+        b.vy += GRAV*dt*0.6;
+        b.y += b.vy*dt;
+        const Ld = ladders[b.ladderId];
+        if(b.y + b.h > Ld.y + Ld.h){
+          // continue drop onto platform below current ladder exit
+          b.state = "drop";
+          b.dropTo = b.platformId - 1;
+          b.ladderId = -1;
+          b.vy = 120;
+        }
+
+      } else { // fall
+        b.vy += GRAV*dt;
+        b.x += b.vx*dt;
+        b.y += b.vy*dt;
+      }
+
+      // hit Ben
+      if(rOverlap({x:b.x,y:b.y,w:b.w,h:b.h},{x:ben.x,y:ben.y,w:ben.w,h:ben.h})){
+        hitBen();
+        bottles.splice(i,1);
+        addScore(25);
+        continue;
+      }
+
+      // cleanup
+      if(b.y > H+120 || b.x < -160 || b.x > W+160){
+        bottles.splice(i,1);
+        addScore(10);
+      }
+    }
+
+    // Goals
+    if(topGoal.type === "gavel"){
+      const g = topGoal;
+      if(rOverlap({x:g.x,y:g.y,w:g.w,h:g.h},{x:ben.x,y:ben.y,w:ben.w,h:ben.h})){
+        addScore(500);
+        state = S.LEVELCLEAR;
+        beep(920,0.16,"triangle",0.05);
+      }
+    } else {
+      for(const m of topGoal.members){
+        if(rOverlap({x:m.x,y:m.y,w:m.w,h:m.h},{x:ben.x,y:ben.y,w:ben.w,h:ben.h})){
+          addScore(1200);
+          state = S.WIN;
+          beep(1100,0.22,"triangle",0.06);
+          break;
+        }
+      }
+    }
+  }
+
+  // -----------------------------
+  // Rendering
+  // -----------------------------
+  function drawText(text, x, y, size, color){
+    ctx.font = `900 ${size}px system-ui, Segoe UI, Arial`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "rgba(0,0,0,.55)";
+    ctx.fillText(text, x+2, y+2);
+    ctx.fillStyle = color;
+    ctx.fillText(text, x, y);
+  }
+  function drawOverlay(){ ctx.fillStyle="rgba(0,0,0,.55)"; ctx.fillRect(0,0,W,H); }
+  function px(x,y,w,h,c){ ctx.fillStyle=c; ctx.fillRect(Math.round(x),Math.round(y),Math.round(w),Math.round(h)); }
+
+  function drawHUD(){
+    ctx.fillStyle="rgba(0,0,0,.35)";
+    ctx.fillRect(0,0,W,34);
+    ctx.font="800 14px system-ui, Segoe UI, Arial";
+    ctx.textBaseline="middle";
+    ctx.textAlign="left";   ctx.fillStyle="#d9e8ff"; ctx.fillText(`SCORE: ${score}`, 12, 17);
+    ctx.textAlign="center"; ctx.fillStyle="#b8c8e8"; ctx.fillText(`${LEVELS[levelIndex].name}`, W/2, 17);
+    ctx.textAlign="right";  ctx.fillStyle="#d9e8ff"; ctx.fillText(`LIVES: ${Math.max(0, ben.lives+1)}  •  HIGH: ${high}`, W-12, 17);
+  }
+
+  function drawCourtroom(){
+    const g = ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0,"#0a0c12"); g.addColorStop(1,"#05060a");
+    ctx.fillStyle=g; ctx.fillRect(0,0,W,H);
+
+    for(let i=0;i<10;i++){
+      const x = 40 + i*90, ww = 70;
+      ctx.fillStyle = (i%2===0) ? "rgba(120,90,60,.18)" : "rgba(90,70,50,.18)";
+      ctx.fillRect(x, 60, ww, 320);
+      ctx.fillStyle = "rgba(0,0,0,.25)";
+      ctx.fillRect(x, 60, ww, 6);
+      ctx.fillRect(x, 374, ww, 6);
+    }
+
+    ctx.fillStyle="rgba(80,60,40,.28)"; ctx.fillRect(0, 42, W, 20);
+    ctx.fillStyle="rgba(0,0,0,.35)";    ctx.fillRect(0, 62, W, 8);
+
+    ctx.fillStyle="rgba(70,50,34,.25)"; ctx.fillRect(0, H-58, W, 58);
+    ctx.fillStyle="rgba(0,0,0,.35)";    ctx.fillRect(0, H-58, W, 8);
+
+    ctx.fillStyle="rgba(255,255,255,.03)";
+    for(let y=0;y<H;y+=4) ctx.fillRect(0,y,W,1);
+  }
+
+  function drawPlatforms(){
+    for(const p of platforms){
+      const x0=p.x0, x1=p.x1, y0=p.y0, y1=p.y1, t=p.thick;
+      ctx.beginPath();
+      ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.lineTo(x1,y1+t); ctx.lineTo(x0,y0+t);
+      ctx.closePath();
+      ctx.fillStyle="rgba(140,95,55,.65)";
+      ctx.fill();
+      ctx.strokeStyle="rgba(255,220,170,.25)";
+      ctx.lineWidth=2;
+      ctx.beginPath(); ctx.moveTo(x0,y0); ctx.lineTo(x1,y1); ctx.stroke();
+
+      const z=p.jumpZone;
+      const zx=z.x+z.w/2;
+      const zy=platformYAtX(p,zx)-18;
+      ctx.fillStyle="rgba(255,210,120,.85)";
+      ctx.fillRect(Math.round(zx-18),Math.round(zy),36,12);
+      ctx.fillStyle="rgba(0,0,0,.55)";
+      ctx.font="900 10px system-ui, Segoe UI, Arial";
+      ctx.textAlign="center"; ctx.textBaseline="middle";
+      ctx.fillText("JUMP", zx, zy+6);
+    }
+  }
+
+  function drawLadders(){
+    for(const Ld of ladders){
+      ctx.fillStyle="rgba(210,190,160,.55)";
+      ctx.fillRect(Math.round(Ld.x),Math.round(Ld.y),3,Math.round(Ld.h));
+      ctx.fillRect(Math.round(Ld.x+Ld.w-3),Math.round(Ld.y),3,Math.round(Ld.h));
+      ctx.fillStyle="rgba(210,190,160,.40)";
+      for(let y=0;y<Ld.h;y+=10){
+        ctx.fillRect(Math.round(Ld.x),Math.round(Ld.y+y),Math.round(Ld.w),2);
+      }
+    }
+  }
+
+  function drawLawyer(x, y, opt){
+    const facing = opt.facing ?? 1;
+    const step = (Math.floor(opt.anim)%8<4) ? 0 : 1;
+    const bob = (Math.floor(opt.anim)%12<6) ? 0 : 1;
+
+    px(x+10, y+2+bob, 8, 8, "#f2d2b6");
+
+    if(opt.evil){
+      px(x+12, y+5+bob, 2, 2, opt.eyes);
+      px(x+16, y+5+bob, 2, 2, opt.eyes);
+    }else{
+      px(x+12, y+6+bob, 2, 2, "#101010");
+      px(x+16, y+6+bob, 2, 2, "#101010");
+    }
+
+    if(opt.evil){
+      px(x+8, y+0+bob, 12, 3, opt.hair);
+      px(x+7, y+2+bob, 2, 4, opt.hair);
+      px(x+19, y+2+bob, 2, 4, opt.hair);
+      px(x+6, y+1+bob, 2, 2, opt.hair);
+      px(x+20, y+1+bob, 2, 2, opt.hair);
+    } else {
+      px(x+10, y+1+bob, 8, 2, opt.hair);
+      px(x+12, y+0+bob, 4, 1, opt.hair);
+      px(x+9, y+2+bob, 2, 2, opt.hair);
+      px(x+17, y+2+bob, 2, 2, opt.hair);
+    }
+
+    px(x+9, y+10+bob, 10, 14, opt.suit);
+    px(x+13, y+12+bob, 2, 10, opt.tie);
+    px(x+12, y+12+bob, 4, 2, opt.tie);
+
+    px(x+7, y+12+bob, 2, 10, opt.suit);
+    px(x+19, y+12+bob, 2, 10, opt.suit);
+
+    px(x+11, y+24+bob, 3, 12, opt.suit);
+    px(x+15, y+24+bob, 3, 12, opt.suit);
+    if(step) px(x+11, y+32+bob, 3, 4, "#000");
+    else px(x+15, y+32+bob, 3, 4, "#000");
+
+    if(facing<0) px(x+6, y+22+bob, 3, 3, "#2b2b2b");
+    else px(x+21, y+22+bob, 3, 3, "#2b2b2b");
+  }
+
+  function drawHotdogEnemy(x, y, dir){
+    px(x+2, y+8, 26, 10, "#c98a4a");
+    px(x+3, y+9, 24, 8, "#d79a5a");
+    px(x+6, y+10, 18, 6, "#b2442f");
+    px(x+7, y+12, 16, 2, "#41b65a");
+    for(let i=0;i<6;i++) px(x+7+i*3, y+11 + (i%2), 2, 2, "#f2d44d");
+    const ex = dir>0 ? x+20 : x+8;
+    px(ex, y+9, 2, 2, "#101010");
+    px(ex+3, y+9, 2, 2, "#101010");
+    px(x+8, y+18, 3, 2, "#101010");
+    px(x+18, y+18, 3, 2, "#101010");
+  }
+
+  function drawHotdogOnBun(x, y, s){
+    const bun="#d79a5a", bun2="#c98a4a", sausage="#b2442f", relish="#41b65a", mustard="#f2d44d";
+    ctx.fillStyle=bun2; ctx.fillRect(x, y+18*s, 110*s, 34*s);
+    ctx.fillStyle=bun;  ctx.fillRect(x+6*s, y+22*s, 98*s, 26*s);
+    ctx.fillStyle=sausage; ctx.fillRect(x+16*s, y+28*s, 78*s, 16*s);
+    ctx.fillStyle=relish;  ctx.fillRect(x+18*s, y+34*s, 74*s, 5*s);
+    ctx.fillStyle=mustard;
+    for(let i=0;i<12;i++) ctx.fillRect(x+20*s+i*6*s, y+30*s + (i%2)*3*s, 4*s, 4*s);
+    ctx.font = `900 ${14*s}px system-ui, Segoe UI, Arial`;
+    ctx.textAlign="center"; ctx.textBaseline="middle";
+    ctx.fillStyle="rgba(0,0,0,.55)";
+    ctx.fillText("HOTDOGGED", x+55*s+2, y+10*s+2);
+    ctx.fillStyle="#ffe7c8";
+    ctx.fillText("HOTDOGGED", x+55*s, y+10*s);
+  }
+
+  function drawGavel(x, y){
+    px(x, y+10, 28, 6, "#8a5a2e");
+    px(x+6, y+2, 14, 10, "#a56a35");
+    px(x+20, y+2, 6, 10, "#7a4c24");
+    px(x+10, y+0, 10, 2, "#c79055");
+    ctx.fillStyle="rgba(255,230,160,.18)";
+    ctx.fillRect(Math.round(x-8), Math.round(y-10), 46, 42);
+  }
+
+  function drawJuryPerson(x, y){
+    px(x+6, y+2, 8, 8, "#f2d2b6");
+    px(x+6, y+0, 8, 2, "#2b2b2b");
+    px(x+5, y+10, 10, 14, "#2a5bd7");
+    px(x+6, y+24, 4, 10, "#2b2b2b");
+    px(x+10, y+24, 4, 10, "#2b2b2b");
+  }
+
+  function drawGoalAndVillain(){
+    if(villain){
+      drawLawyer(villain.x, villain.y, {
+        suit:"#0c0f18", tie:"#b21b2a", hair:"#202020",
+        eyes:"#ff2a2a", evil:true, anim:villain.anim
+      });
+    }
+    if(topGoal){
+      if(topGoal.type==="gavel") drawGavel(topGoal.x, topGoal.y);
+      else{
+        for(const m of topGoal.members) drawJuryPerson(m.x, m.y);
+        ctx.font="900 12px system-ui, Segoe UI, Arial";
+        ctx.textAlign="center"; ctx.textBaseline="middle";
+        ctx.fillStyle="rgba(255,255,255,.75)";
+        ctx.fillText("SAVE THE JURY!", W/2, 44);
+      }
+    }
+  }
+
+  function drawBottles(){
+    for(const b of bottles){
+      ctx.save();
+      ctx.translate(Math.round(b.x + b.w/2), Math.round(b.y + b.h/2));
+      ctx.rotate(b.rot*0.12);
+      ctx.translate(-b.w/2, -b.h/2);
+
+      ctx.fillStyle="#0b0b0b"; ctx.fillRect(-1,-1,b.w+2,b.h+2);
+      ctx.fillStyle="#f1f6ff"; ctx.fillRect(0,2,b.w,b.h-2);
+      ctx.fillStyle="#d9e6ff"; ctx.fillRect(0,0,b.w,4);
+      ctx.fillStyle="#3a7bd5"; ctx.fillRect(2,8,b.w-4,9);
+
+      ctx.fillStyle="#fff";
+      ctx.font="900 7px system-ui, Arial";
+      ctx.textAlign="center"; ctx.textBaseline="middle";
+      ctx.fillText("FOCUS", b.w/2, 12);
+      ctx.fillText("MAX", b.w/2, 18);
+
+      ctx.restore();
+    }
+  }
+
+  function drawHotdogs(){
+    for(const h of hotdogs){
+      const wob = (Math.floor(h.anim)%10<5) ? 0 : 1;
+      drawHotdogEnemy(h.x, h.y + wob, h.vx>=0 ? 1 : -1);
+    }
+  }
+
+  function drawBen(){
+    if(ben.form==="ben"){
+      const flashing = ben.invuln>0 && (Math.floor(t*18)%2===0);
+      if(flashing) ctx.globalAlpha = 0.35;
+      drawLawyer(ben.x, ben.y, {
+        suit:"#090c14", tie:"#19a35b", hair:"#5b3a20",
+        eyes:"#101010", evil:false, anim:ben.anim, facing:ben.facing
+      });
+      ctx.globalAlpha = 1;
+    } else {
+      drawHotdogOnBun(W/2-50, H/2-10, 2.2);
+    }
+  }
+
+  function draw(){
+    drawCourtroom();
+
+    if(state===S.TITLE){
+      drawText("BEN STONE V. FOCUS MAX", W/2, H*0.40, 44, "#f3f7ff");
+      drawText("PRESS SPACE", W/2, H*0.56, 22, "#b8c8e8");
+      drawText("ARROWS MOVE • SPACE JUMP • UP CLIMB", W/2, H*0.66, 16, "#7f93b8");
+      requestAnimationFrame(loop);
+      return;
+    }
+
+    if(state===S.INSTR){
+      drawText("MISSION", W/2, 92, 28, "#f3f7ff");
+      drawText("CLIMB THE COURTROOM RAMPS.", W/2, 140, 18, "#b8c8e8");
+      drawText("DODGE 'FOCUS MAX' BOTTLES + HOTDOG ENEMIES.", W/2, 168, 18, "#b8c8e8");
+      drawText("REACH THE GAVEL (OR SAVE THE JURY IN THE BOSS LEVEL).", W/2, 196, 18, "#b8c8e8");
+      drawText("CONTROLS", W/2, 260, 28, "#f3f7ff");
+      drawText("← → MOVE   •   SPACE JUMP   •   ↑ CLIMB LADDERS", W/2, 305, 18, "#b8c8e8");
+      drawText("IMPORTANT RULE", W/2, 372, 28, "#ffd7a2");
+      drawText("ONLY JUMPS FROM 'JUMP HERE' CAN REACH THE NEXT PLATFORM.", W/2, 408, 16, "#ffd7a2");
+      drawText("PRESS SPACE TO BEGIN", W/2, 472, 20, "#cfe0ff");
+      requestAnimationFrame(loop);
+      return;
+    }
+
+    drawPlatforms();
+    drawLadders();
+    drawGoalAndVillain();
+    drawBottles();
+    drawHotdogs();
+    drawBen();
+    drawHUD();
+
+    if(state===S.LEVELCLEAR){
+      drawOverlay();
+      drawText("LEVEL CLEARED!", W/2, H*0.42, 34, "#d7ffe6");
+      drawText("PRESS SPACE FOR NEXT LEVEL", W/2, H*0.52, 18, "#b8c8e8");
+    }
+    if(state===S.WIN){
+      drawOverlay();
+      drawText("YOU WIN!", W/2, H*0.40, 44, "#d7ffe6");
+      drawText("FOCUS MAX DEFEATED.", W/2, H*0.50, 18, "#b8c8e8");
+      drawText("PRESS SPACE TO RETURN TO TITLE", W/2, H*0.60, 16, "#7f93b8");
+    }
+    if(state===S.OVER){
+      drawOverlay();
+      drawText("DEFEAT!", W/2, H*0.40, 44, "#ffd7d7");
+      drawText("BEN STONE IS A HOTDOG NOW.", W/2, H*0.50, 18, "#ffd7a2");
+      drawText("PRESS SPACE TO RETURN TO TITLE", W/2, H*0.60, 16, "#7f93b8");
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  function loop(now){
+    if(now==null) now = performance.now();
+    const dt = Math.min(DT_CAP, (now-last)/1000);
+    last = now;
+
+    update(dt);
+
+    if(state === S.DEATHMORPH){
+      drawCourtroom();
+      drawPlatforms();
+      drawLadders();
+      drawGoalAndVillain();
+      drawBottles();
+      drawHotdogs();
+      drawHUD();
+
+      const m = deathMorph.t;
+      ctx.save(); ctx.globalAlpha = 1 - m;
+      drawLawyer(deathMorph.x, deathMorph.y, { suit:"#090c14", tie:"#19a35b", hair:"#5b3a20", eyes:"#101010", evil:false, anim:ben.anim, facing:ben.facing });
+      ctx.restore();
+
+      ctx.save(); ctx.globalAlpha = m;
+      const s = 0.7 + m*1.4;
+      drawHotdogOnBun(deathMorph.x-22, deathMorph.y+6, s);
+      ctx.restore();
+
+      drawText("BEN STONE HAS BECOME A HOTDOG…", W/2, 70, 20, "#ffd7a2");
+      requestAnimationFrame(loop);
+      return;
+    }
+
+    draw();
+  }
+
+  // Start idle
+  buildLevel(0);
+  requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
